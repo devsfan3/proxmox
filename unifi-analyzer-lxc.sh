@@ -403,6 +403,10 @@ APP_DIR="$APP_ROOT/app"
 DATA_DIR="$APP_ROOT/data"
 
 export DEBIAN_FRONTEND=noninteractive
+# pct exec passes the host's LANG in, and the fresh container has not generated
+# it. Everything then warns about a locale it cannot set. C.UTF-8 is built into
+# glibc, so it needs nothing installed and the warnings stop.
+export LANG=C.UTF-8 LC_ALL=C.UTF-8
 
 echo "--> Installing packages"
 apt-get update -qq
@@ -539,7 +543,7 @@ systemctl enable --now unifi-analyzer >/dev/null
 
 # Started is not the same as serving. Give uvicorn a moment, then ask it.
 for i in $(seq 1 30); do
-  if curl -fsS -o /dev/null "http://127.0.0.1:$PORT/"; then
+  if curl -fs -o /dev/null "http://127.0.0.1:$PORT/" 2>/dev/null; then
     echo "--> Analyzer is answering on port $PORT"
     exit 0
   fi
