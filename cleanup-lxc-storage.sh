@@ -64,9 +64,11 @@ Options:
 USAGE
 }
 
-log()  { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG"; }
-warn() { printf '%s  WARN: %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG" >&2; }
-die()  { printf '\nERROR: %s\n' "$*" | tee -a "$LOG" >&2; exit 1; }
+# tee is quiet about a log it cannot open: preflight can fail before the log
+# file exists, and the message matters more than where it was recorded.
+log()  { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG" 2>/dev/null; }
+warn() { printf '%s  WARN: %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG" 2>/dev/null >&2; }
+die()  { printf '\nERROR: %s\n' "$*" | tee -a "$LOG" 2>/dev/null >&2; exit 1; }
 
 confirm() {
   [[ $ASSUME_YES -eq 1 ]] && return 0
@@ -83,6 +85,9 @@ kb_human() {
 }
 
 # ---------------------------------------------------------------- args
+# A leading -- is how the curl one-liner separates its flags; harmless here.
+if [[ "${1:-}" == "--" ]]; then shift; fi
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --apply)           APPLY=1; shift ;;

@@ -67,6 +67,11 @@ ok "$(wc -c <"$TMP" | tr -d ' ') bytes, parses clean"
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
+# In "bash -c "$(curl ...)" -- --apply", bash takes the -- as $0 and never
+# passes it on. Run from a file, the same line hands it over as an argument;
+# drop it so both spellings work.
+if [ "${1:-}" = "--" ]; then shift; fi
+
 case " $* " in
   *" --apply "*) : ;;
   *" --help "*|*" -h "*) : ;;
