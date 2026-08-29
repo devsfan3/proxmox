@@ -1,11 +1,12 @@
 # proxmox
 
-Scripts for building Proxmox VE containers, in the style of the community
-helper scripts: run one line on the Proxmox host and get a working service.
+Scripts for building and looking after Proxmox VE containers, in the style of
+the community helper scripts: run one line on the Proxmox host and get the job
+done.
 
-Each script creates its own container, installs into it, and can update that
-container later. Read a script before running it — everything below runs as
-root on your hypervisor.
+Some of these build a container and can update it later; others work across the
+containers you already have. Read a script before running it — everything below
+runs as root on your hypervisor.
 
 ## unifi-analyzer-lxc.sh
 
@@ -94,6 +95,67 @@ journalctl -u unifi-analyzer -f      # what it is doing
 
 The analyzer lives in `/opt/unifi-analyzer/app`, its data in
 `/opt/unifi-analyzer/data`, and it runs as the unprivileged `analyzer` user.
+
+## cleanup-lxc-storage.sh
+
+Reclaims disk space *inside* the containers you already run, with the leftovers
+the community helper scripts create as they install and update: the old
+`/opt/<app>_bak` tree an update moved aside, the release tarball it downloaded
+next to it, the `.deb` still sitting in `/root`, package manager caches,
+journald, rotated logs, and npm/pip/go build caches. Then it runs `pct fstrim`
+so the freed blocks go back to a thin-LVM or ZFS pool instead of only back to
+the guest filesystem.
+
+### Run
+
+On the Proxmox VE host, as root:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/devsfan3/proxmox/main/cleanup-lxc.sh)"
+```
+
+`cleanup-lxc.sh` fetches `cleanup-lxc-storage.sh` and runs it, so nothing has to
+live on the host. **That command is a dry run**: it walks every container and
+prints what it would delete, per category and per path, without deleting any of
+it. When the list looks right, do it for real — flags go after the `--`:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/devsfan3/proxmox/main/cleanup-lxc.sh)" -- --apply
+```
+
+Or run the cleanup script directly, if you would rather keep a copy:
+
+```bash
+curl -fsSL -o cleanup-lxc-storage.sh https://raw.githubusercontent.com/devsfan3/proxmox/main/cleanup-lxc-storage.sh
+bash cleanup-lxc-storage.sh --apply 105 110
+```
+
+### Options
+
+| | |
+| --- | --- |
+| `--apply` | actually delete; without it, nothing is removed |
+| `105 110` | only these container IDs (default: all of them) |
+| `--exclude 100,101` | skip these |
+| `--age N` | keep backups and downloads newer than N days (default 7) |
+| `--journal-size 32M` | how much journald history to keep (default 64M) |
+| `--aggressive` | also `/var/lib/apt/lists`, `/var/cache`, cargo, and truncate live `*.log` over 10 MB |
+| `--docker` | `docker system prune -af` where docker is installed — images and build cache, never volumes |
+| `--include-stopped` | start stopped containers to clean them, then shut them back down |
+| `--no-trim` | skip `pct fstrim` |
+| `-y` | do not ask before applying |
+
+### What it will not touch
+
+Anything newer than `--age` days, so the backup copy from an update you ran
+this week is still there to roll back to. Templates. Stopped containers, unless
+you ask for them. Docker volumes. Live log files, unless `--aggressive`, and
+even then they are truncated rather than deleted so the process writing to them
+keeps its file handle.
+
+It works on Debian and Ubuntu containers (apt), Alpine (apk), and Fedora and
+friends (dnf). Each run is logged to `/var/log/lxc-cleanup-<timestamp>.log` on
+the host.
 
 ## Licence
 
