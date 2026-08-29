@@ -253,16 +253,32 @@ pct status "$CTID" >/dev/null 2>&1 && die "Container $CTID already exists. Pick 
 info "Finding a Debian template"
 pveam update >/dev/null 2>&1 || warn "Could not refresh the template list; using what is cached."
 
+# The architecture matters more than it looks. pveam lists templates for
+# several, and picking the newest by version sort alone lands on arm64 ahead of
+# amd64 because "arm" sorts after "amd". The container then builds fine and
+# dies at startup with "Exec format error - Failed to exec /sbin/init", which
+# says nothing about architecture. Filter on the host's own instead.
+HOST_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+
 if [ -z "$TEMPLATE" ]; then
-  # Newest Debian standard template on offer, falling back a release at a time
-  # so this keeps working after Proxmox retires or adds one.
+  # Newest Debian standard template for this architecture, falling back a
+  # release at a time so this keeps working after Proxmox retires or adds one.
   for series in debian-13-standard debian-12-standard debian-11-standard; do
     TEMPLATE="$(pveam available --section system 2>/dev/null \
-                | awk -v s="$series" '$2 ~ s {print $2}' | sort -V | tail -1)"
+                | awk -v s="$series" -v a="_${HOST_ARCH}." \
+                      '$2 ~ s && index($2, a) {print $2}' | sort -V | tail -1)"
     [ -n "$TEMPLATE" ] && break
   done
+  [ -n "$TEMPLATE" ] || die "No Debian template for $HOST_ARCH is available. Check the host's internet access, or pass TEMPLATE=<file>."
+else
+  # An explicitly chosen template is the caller's business, but the failure it
+  # causes is opaque enough to be worth a warning.
+  case "$TEMPLATE" in
+    *_"$HOST_ARCH".*) : ;;
+    *) warn "TEMPLATE=$TEMPLATE does not look like a $HOST_ARCH template. If the container starts and immediately dies with 'Exec format error', this is why." ;;
+  esac
 fi
-[ -n "$TEMPLATE" ] || die "No Debian template available. Check the host's internet access, or pass TEMPLATE=<file>."
+ok "Template for $HOST_ARCH: $TEMPLATE"
 
 if pveam list "$TEMPLATE_STORAGE" 2>/dev/null | grep -qF "$TEMPLATE"; then
   ok "Template already downloaded: $TEMPLATE"
@@ -294,6 +310,7 @@ pct create "$CTID" "$TEMPLATE_REF" \
   --rootfs "$STORAGE:$DISK" \
   --net0 "$NET0" \
   --unprivileged "$UNPRIVILEGED" \
+  --features nesting=1 \
   --onboot 1 \
   --description "UniFi Support File Analyzer — $REPO_URL" \
   >/dev/null || die "pct create failed."
@@ -330,6 +347,19 @@ if ! pct start "$CTID" >/dev/null 2>&1; then
   echo >&2
   tail -n 40 "$START_LOG" >&2
   echo >&2
+
+  if grep -q "Exec format error" "$START_LOG" 2>/dev/null; then
+    die "Container $CTID would not start: the template is built for a different
+CPU architecture than this host ($HOST_ARCH). That is what
+\"Exec format error - Failed to exec /sbin/init\" means.
+
+Template used: $TEMPLATE
+Full log:      $START_LOG
+
+Remove it and run again without TEMPLATE set, and the right one is chosen:
+  pct destroy $CTID"
+  fi
+
   die "Container $CTID would not start. Full log: $START_LOG
 
 What usually causes this:
