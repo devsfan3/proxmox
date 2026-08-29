@@ -67,9 +67,12 @@ Options:
 USAGE
 }
 
-log()  { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG"; }
-warn() { printf '%s  WARN: %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG" >&2; }
-die()  { printf '\nERROR: %s\n' "$*" | tee -a "$LOG" >&2; exit 1; }
+# LOG is empty until the arguments have been validated, and tee will not take
+# an empty filename - so everything goes through here.
+_tee() { if [[ -n "${LOG:-}" ]]; then tee -a "$LOG"; else cat; fi; }
+log()  { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" | _tee; }
+warn() { printf '%s  WARN: %s\n' "$(date +%H:%M:%S)" "$*" | _tee >&2; }
+die()  { printf '\nERROR: %s\n' "$*" | _tee >&2; exit 1; }
 
 confirm() {
   [[ $ASSUME_YES -eq 1 ]] && return 0
