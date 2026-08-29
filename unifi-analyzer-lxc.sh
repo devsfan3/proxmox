@@ -294,7 +294,6 @@ pct create "$CTID" "$TEMPLATE_REF" \
   --rootfs "$STORAGE:$DISK" \
   --net0 "$NET0" \
   --unprivileged "$UNPRIVILEGED" \
-  --features nesting=1 \
   --onboot 1 \
   --description "UniFi Support File Analyzer — $REPO_URL" \
   >/dev/null || die "pct create failed."
@@ -302,9 +301,19 @@ ok "Container created"
 
 # Undo a half-built container rather than leaving one behind to clean up by
 # hand. Only from here on: before this point there is nothing to remove.
+# Set when the container is worth more as evidence than it is as mess. A
+# container that would not start is the thing you need to look at to find out
+# why, and destroying it takes the answer with it.
+KEEP_CONTAINER=0
+
 cleanup_on_failure() {
   local code=$?
   [ "$code" = "0" ] && return 0
+  if [ "$KEEP_CONTAINER" = "1" ]; then
+    warn "Leaving container $CTID in place so it can be examined."
+    warn "Remove it yourself when you are done: pct destroy $CTID"
+    return "$code"
+  fi
   warn "Install failed — removing container $CTID"
   pct stop "$CTID" >/dev/null 2>&1 || true
   pct destroy "$CTID" >/dev/null 2>&1 || true
@@ -313,7 +322,27 @@ cleanup_on_failure() {
 trap cleanup_on_failure EXIT
 
 info "Starting container"
-pct start "$CTID" >/dev/null || die "Container would not start."
+if ! pct start "$CTID" >/dev/null 2>&1; then
+  KEEP_CONTAINER=1
+  START_LOG="/tmp/lxc-$CTID-start.log"
+  warn "The container did not start. Running it again with debug logging."
+  pct start "$CTID" --debug >"$START_LOG" 2>&1 || true
+  echo >&2
+  tail -n 40 "$START_LOG" >&2
+  echo >&2
+  die "Container $CTID would not start. Full log: $START_LOG
+
+What usually causes this:
+  - a bridge that exists but is not up, or has no port carrying traffic
+  - a VLAN tag on a bridge that is not VLAN-aware
+  - storage the container's rootfs cannot be mapped onto
+  - for an unprivileged container, missing or exhausted /etc/subuid and
+    /etc/subgid ranges for root
+
+Look at:  pct config $CTID
+Retry on the built-in bridge:
+  pct set $CTID --net0 name=eth0,bridge=vmbr0,ip=dhcp && pct start $CTID"
+fi
 
 # systemd being up is not the same as the network being usable, and apt fails
 # in a way that reads like a broken mirror if you go too early.
