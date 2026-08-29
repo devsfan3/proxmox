@@ -157,6 +157,140 @@ It works on Debian and Ubuntu containers (apt), Alpine (apk), and Fedora and
 friends (dnf). Each run is logged to `/var/log/lxc-cleanup-<timestamp>.log` on
 the host.
 
+## upgrade-lxc-trixie.sh
+
+Upgrades one container from Debian 12 to Debian 13 in place, with the two things
+that go wrong on Proxmox handled before they can: systemd's credential plumbing,
+and third-party apt repositories.
+
+Debian 13 ships systemd 257, which turns on credentials by default and leaves an
+unprivileged container failing every service with `status=243/CREDENTIALS`. The
+script installs Debian's own `lxc.generator` first, so the container comes back
+up rather than needing rescue from `pct enter`.
+
+### Run
+
+On the Proxmox VE host, as root:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/devsfan3/proxmox/main/upgrade-lxc-trixie.sh)" -- 105
+```
+
+Flags go after the `--`. It refuses to run on Proxmox VE 8, refuses a container
+that is not bookworm, checks there is room for the upgrade, snapshots, then
+rewrites sources, `full-upgrade`s without prompting, reboots and reports.
+
+By default it stops when it finds an apt source pointing anywhere other than
+Debian, and lists them, because that is a decision only you can make:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/devsfan3/proxmox/main/upgrade-lxc-trixie.sh)" -- 105 --third-party disable
+```
+
+### Options
+
+| | |
+| --- | --- |
+| `105` | the container to upgrade (required) |
+| `--backup snapshot\|vzdump\|none` | how to make it undoable (default: snapshot) |
+| `--storage NAME` | vzdump target storage (default: `local`) |
+| `--third-party abort\|disable\|keep` | non-Debian repos: stop and list them (default), rename them to `*.trixie-disabled`, or leave them on bookworm |
+| `--no-reboot` | upgrade, but leave the reboot to you |
+| `-y` | do not ask before starting |
+
+`keep` deliberately does not rewrite those repositories to trixie. A repository
+pointed at a suite its publisher has not built is how you get a container
+half-upgraded.
+
+### Afterwards
+
+Roll back with `pct rollback <CTID> pretrixie_<timestamp>` — the script prints
+the exact command when it finishes. Old repository files are kept inside the
+container as `*.bookworm.bak`, and each run is logged to
+`/var/log/lxc-trixie-<CTID>-<timestamp>.log` on the host.
+
+PHP applications need their modules reinstalling afterwards; trixie moves to PHP
+8.4 and nothing carries the old ones across. Check the application itself, not
+only `systemctl --failed` — a service can start perfectly and still have lost
+what it was pointed at.
+
+To sort a fleet into containers that will upgrade cleanly and ones that will
+not, look for foreign repositories first:
+
+```bash
+for id in $(pct list | awk 'NR>1 {print $1}'); do echo "=== $id ==="; pct exec $id -- grep -rhoE 'https?://[^ ]+' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | grep -v debian.org | sort -u; done
+```
+
+## rebuild-lxc-trixie.sh
+
+The other way to get to Debian 13: build a fresh container from the Debian 13
+template, install the application into it, and move the data across. Worth the
+extra effort for PHP applications, for anything you installed by hand outside
+apt, and for containers that are already unwell — upgrading those carries the
+problem forward.
+
+It runs in phases, because the mechanical half can be automated and the other
+half cannot. You write a short config per application saying where its data
+lives; the script does everything else.
+
+### Run
+
+The workflow needs a config file on the host, so keep a copy rather than piping
+it:
+
+```bash
+curl -fsSL -o rebuild-lxc-trixie.sh https://raw.githubusercontent.com/devsfan3/proxmox/main/rebuild-lxc-trixie.sh
+curl -fsSL -o jellyfin.conf https://raw.githubusercontent.com/devsfan3/proxmox/main/examples/sample-app.conf
+bash rebuild-lxc-trixie.sh full 105 206 --conf jellyfin.conf
+```
+
+`full` captures the data, creates container 206 shaped like 105, installs the
+application, restores the data — and then **stops**. The new container is up on
+DHCP with a fresh MAC, so it can be tested alongside the original, which has not
+been touched. When it works:
+
+```bash
+bash rebuild-lxc-trixie.sh cutover 105 206
+```
+
+Cutover stops the old container, sets `onboot 0` on it, and moves its hostname,
+static address and original MAC to the new one. `rollback 105 206` puts it all
+back.
+
+### Phases
+
+| | |
+| --- | --- |
+| `capture <OLD>` | stops the services, dumps the databases, tars the declared paths, pulls it all to `/var/lib/vz/migrate/` with the old `pct config` |
+| `create <OLD> <NEW>` | new container with the old one's cores, memory, features, storage and size; bind mounts reattached, volume mounts recreated empty |
+| `provision <NEW>` | updates the base system, then runs your `PROVISION_CMD` |
+| `restore <NEW>` | extracts the data *inside* the container so unprivileged id shifting is the kernel's problem, replays the database, fixes ownership |
+| `cutover <OLD> <NEW>` | moves the identity across |
+| `rollback <OLD> <NEW>` | undoes a cutover |
+
+### The config
+
+See `examples/sample-app.conf` for one backed by sqlite and
+`examples/postgres-app.conf` for one with a real database. It is sourced by
+bash:
+
+| | |
+| --- | --- |
+| `SERVICES` | stopped before the data is read and before it is written back |
+| `DATA_PATHS` | everything that must survive, as seen inside the container |
+| `DB_TYPE` | `none`, `postgres` or `mysql` |
+| `PROVISION_CMD` | how the application gets installed into the fresh container |
+| `CHOWN_MAP` | `user:group /path` entries to reassert after extraction |
+| `POST_RESTORE_CMD` | anything else once the data is in place |
+
+Never put `/var/lib/postgresql` in `DATA_PATHS`. Set `DB_TYPE=postgres` and let
+it dump and replay — a data directory written by PostgreSQL 15 will not start
+under the 17 that trixie ships.
+
+The capture is a full copy of the data on the host, so check `df` first if the
+application is large. Data on bind mounts costs nothing: those are reattached to
+the new container, not copied, so leave those paths out.
+
 ## Licence
 
 These scripts are MIT. The UniFi Support File Analyzer is a separate project
