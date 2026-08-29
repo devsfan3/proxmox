@@ -9,7 +9,7 @@
 #
 # What it does, in order:
 #   1. preflight  (PVE 9, container exists, is bookworm, enough disk)
-#   2. scan for third-party apt repos and act per --third-party
+#   2. resolve third-party apt repos per --third-party
 #   3. take a snapshot or vzdump backup
 #   4. install Debian's lxc.generator  (the 243/CREDENTIALS fix)
 #   5. rewrite sources to trixie, full-upgrade, autoremove, modernize-sources
@@ -21,7 +21,7 @@ set -euo pipefail
 
 CTID=""
 BACKUP="snapshot"        # snapshot | vzdump | none
-THIRD_PARTY="abort"      # abort | disable | keep
+THIRD_PARTY="probe"      # probe | abort | disable | keep
 STORAGE="local"          # only used by --backup vzdump
 DO_REBOOT=1
 ASSUME_YES=0
@@ -44,7 +44,7 @@ Run on the Proxmox VE 9 host, as root:
 
 Order of operations:
   1. preflight  (PVE 9, container exists, is bookworm, enough disk)
-  2. scan for third-party apt repos and act per --third-party
+  2. resolve third-party apt repos per --third-party
   3. take a snapshot or vzdump backup
   4. install Debian's lxc.generator  (the 243/CREDENTIALS fix)
   5. rewrite sources to trixie, full-upgrade, autoremove, modernize-sources
@@ -55,10 +55,12 @@ USAGE
 Options:
   --backup snapshot|vzdump|none   default: snapshot
   --storage NAME                  vzdump target storage (default: local)
-  --third-party abort|disable|keep
-        abort   (default) stop and list non-Debian repos so you can decide
+  --third-party probe|abort|disable|keep
+        probe   (default) ask each non-Debian repo where it publishes trixie
+                and rewrite it to that; leave version-independent repos alone
+        abort   stop and list them so you can decide by hand
         disable rename them to *.trixie-disabled, re-enable them yourself later
-        keep    leave them untouched, still pointing at bookworm
+        keep    leave them exactly as they are
   --no-reboot                     do the upgrade, skip the reboot + verify
   -y, --yes                       don't ask for confirmation
   -h, --help
@@ -97,7 +99,7 @@ done
 [[ -n "$CTID" ]] || { usage; exit 1; }
 [[ "$CTID" =~ ^[0-9]+$ ]] || die "CTID must be numeric, got '$CTID'"
 [[ "$BACKUP" =~ ^(snapshot|vzdump|none)$ ]] || die "--backup must be snapshot, vzdump or none"
-[[ "$THIRD_PARTY" =~ ^(abort|disable|keep)$ ]] || die "--third-party must be abort, disable or keep"
+[[ "$THIRD_PARTY" =~ ^(probe|abort|disable|keep)$ ]] || die "--third-party must be probe, abort, disable or keep"
 
 LOG="/var/log/lxc-trixie-${CTID}-$(date +%Y%m%d%H%M%S).log"
 touch "$LOG" 2>/dev/null || LOG="/tmp/lxc-trixie-${CTID}.log"
@@ -182,6 +184,57 @@ case "${1:-}" in
     cat "$TP_LIST"
     ;;
 
+  list-repos)
+    # emit "file|uri|suite" for every third-party repo entry
+    [ -s "$TP_LIST" ] || exit 0
+    while read -r f; do
+      [ -f "$f" ] || continue
+      case "$f" in
+        *.sources)
+          awk -v F="$f" '
+            /^[Uu][Rr][Ii][Ss]:/    { nu=0; for(i=2;i<=NF;i++) us[++nu]=$i }
+            /^[Ss][Uu][Ii][Tt][Ee][Ss]:/  { ns=0; for(i=2;i<=NF;i++) ss[++ns]=$i
+                             for(a=1;a<=nu;a++) for(b=1;b<=ns;b++)
+                               print F "|" us[a] "|" ss[b] }
+          ' "$f"
+          ;;
+        *)
+          awk -v F="$f" '
+            /^[[:space:]]*deb(-src)?[[:space:]]/ {
+              for(i=1;i<=NF;i++) if($i ~ /^https?:/) { print F "|" $i "|" $(i+1); break }
+            }
+          ' "$f"
+          ;;
+      esac
+    done < "$TP_LIST" | sort -u
+    ;;
+
+  apply-thirdparty)
+    # act on the plan the host pushed in: REWRITE|file|uri|old|new
+    [ -s /root/.trixie-tp-plan ] || exit 0
+    while IFS='|' read -r verb f uri old new; do
+      [ "$verb" = "REWRITE" ] || continue
+      [ -f "$f" ] || continue
+      [ -f "$f.bookworm.bak" ] || cp -a "$f" "$f.bookworm.bak"
+      case "$f" in
+        *.sources)
+          awk -v o="$old" -v n="$new" '
+            /^[Ss][Uu][Ii][Tt][Ee][Ss]:/ { out=$1; for(i=2;i<=NF;i++){ t=$i; if(t==o) t=n; out=out" "t }
+                            print out; next }
+            { print }' "$f" > /tmp/.tp.$$ ;;
+        *)
+          awk -v o="$old" -v n="$new" '
+            /^[[:space:]]*deb(-src)?[[:space:]]/ {
+              for(i=1;i<=NF;i++) if($i ~ /^https?:/) { if($(i+1)==o) $(i+1)=n; break }
+              print; next }
+            { print }' "$f" > /tmp/.tp.$$ ;;
+      esac
+      # write through the existing inode so owner and mode survive
+      cat /tmp/.tp.$$ > "$f" && rm -f /tmp/.tp.$$
+      echo "rewrote $f: $old -> $new"
+    done < /root/.trixie-tp-plan
+    ;;
+
   disable-thirdparty)
     [ -s "$TP_LIST" ] || exit 0
     while read -r f; do
@@ -255,13 +308,61 @@ pct push "$CTID" "$gen_local"    /root/.lxc.generator   --perms 0644
 rm -f "$helper_local" "$gen_local"
 
 # ---------------------------------------------------------------- third-party repos
+# Probing runs on the host: PVE always has curl, and a container that cannot
+# reach a repo the host can will fail loudly at 'apt update' anyway.
+probe_url() { curl -fsS -o /dev/null -m 10 -w '%{http_code}' "$1" 2>/dev/null || echo 000; }
+
 mapfile -t tp < <(in_ct bash /root/.trixie-helper.sh scan)
-if (( ${#tp[@]} > 0 )); then
+if (( ${#tp[@]} == 0 )); then
+  log "no third-party apt repos"
+else
   log "third-party apt repos found:"
   printf '    %s\n' "${tp[@]}" | tee -a "$LOG"
+
   case "$THIRD_PARTY" in
+    probe)
+      log "working out where each of them publishes trixie"
+      plan="$(mktemp)"; unresolved=0; rewrites=0; skipped=0
+      while IFS='|' read -r f uri suite; do
+        [[ -n "$uri" && -n "$suite" ]] || continue
+        base="${uri%/}"
+        if [[ "$suite" != *bookworm* ]]; then
+          printf '    %-46s %-18s not a Debian codename, left alone\n' "$(basename "$f")" "$suite" | tee -a "$LOG"
+          skipped=$(( skipped + 1 ))
+          continue
+        fi
+        cand="${suite//bookworm/trixie}"
+        if [[ "$(probe_url "$base/dists/$cand/Release")" == 200 ]]; then
+          printf '    %-46s %-18s -> %s\n' "$(basename "$f")" "$suite" "$cand" | tee -a "$LOG"
+          echo "REWRITE|$f|$uri|$suite|$cand" >> "$plan"
+          rewrites=$(( rewrites + 1 ))
+        elif [[ "$(probe_url "$base/dists/any/Release")" == 200 ]]; then
+          printf '    %-46s %-18s -> any (no trixie, but distro-agnostic)\n' "$(basename "$f")" "$suite" | tee -a "$LOG"
+          echo "REWRITE|$f|$uri|$suite|any" >> "$plan"
+          rewrites=$(( rewrites + 1 ))
+        else
+          printf '    %-46s %-18s NO TRIXIE - staying on bookworm\n' "$(basename "$f")" "$suite" | tee -a "$LOG"
+          echo "    ($base publishes neither $cand nor any)" | tee -a "$LOG"
+          unresolved=$(( unresolved + 1 ))
+        fi
+      done < <(in_ct bash /root/.trixie-helper.sh list-repos)
+
+      if (( rewrites > 0 )); then
+        pct push "$CTID" "$plan" /root/.trixie-tp-plan
+        in_ct bash /root/.trixie-helper.sh apply-thirdparty 2>&1 | tee -a "$LOG"
+      fi
+      rm -f "$plan"
+      log "third-party repos: $rewrites rewritten, $skipped already version-independent, $unresolved unresolved"
+
+      if (( unresolved > 0 )); then
+        warn "$unresolved repo(s) have no trixie and no 'any' - they stay on bookworm."
+        warn "Their packages keep working but stop updating. Check whether the vendor"
+        warn "uses a suite name of its own (some publish 'stable'), or drop the repo."
+        confirm "continue with those left on bookworm?" || die "aborted"
+      fi
+      ;;
     abort)
-      die "re-run with --third-party disable (rename them aside) or --third-party keep (leave them on bookworm), or fix them by hand first"
+      die "re-run with --third-party probe (work out the right suite for each), disable (rename them aside) or keep (leave them exactly as they are), or fix them by hand first"
       ;;
     disable)
       log "disabling them"
@@ -269,11 +370,9 @@ if (( ${#tp[@]} > 0 )); then
       log "remember to re-add these repos with trixie suites after the upgrade"
       ;;
     keep)
-      warn "leaving them pointing at bookworm - their packages will not be upgraded"
+      warn "leaving them exactly as they are - nothing here will be rewritten"
       ;;
   esac
-else
-  log "no third-party apt repos"
 fi
 
 # ---------------------------------------------------------------- backup

@@ -180,12 +180,26 @@ Flags go after the `--`. It refuses to run on Proxmox VE 8, refuses a container
 that is not bookworm, checks there is room for the upgrade, snapshots, then
 rewrites sources, `full-upgrade`s without prompting, reboots and reports.
 
-By default it stops when it finds an apt source pointing anywhere other than
-Debian, and lists them, because that is a decision only you can make:
+Third-party apt repositories are worked out rather than guessed at. For each
+one, the script asks the publisher where it keeps trixie — `dists/<suite>/Release`
+— and rewrites only what needs rewriting:
 
-```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/devsfan3/proxmox/main/upgrade-lxc-trixie.sh)" -- 105 --third-party disable
 ```
+docker.list        bookworm       -> trixie
+pgdg.list          bookworm-pgdg  -> trixie-pgdg
+cloudflared.list   bookworm       -> any (no trixie, but distro-agnostic)
+grafana.list       stable         not a Debian codename, left alone
+```
+
+That distinction matters more than it looks. A blind `sed` of bookworm to
+trixie rewrites Grafana's `stable` suite into nothing, and leaves Docker's
+`stable` *component* alone while missing that its suite needed changing. The
+script only ever replaces the suite field, and only when the publisher has
+something to serve there.
+
+Anything with no trixie and no `any` is left on bookworm, reported, and you are
+asked before the upgrade goes ahead. Those packages keep working; they stop
+updating.
 
 ### Options
 
@@ -194,13 +208,13 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/devsfan3/proxmox/main/up
 | `105` | the container to upgrade (required) |
 | `--backup snapshot\|vzdump\|none` | how to make it undoable (default: snapshot) |
 | `--storage NAME` | vzdump target storage (default: `local`) |
-| `--third-party abort\|disable\|keep` | non-Debian repos: stop and list them (default), rename them to `*.trixie-disabled`, or leave them on bookworm |
+| `--third-party probe\|abort\|disable\|keep` | non-Debian repos: resolve each one against its publisher (default), stop and list them, rename them to `*.trixie-disabled`, or leave them exactly as they are |
 | `--no-reboot` | upgrade, but leave the reboot to you |
 | `-y` | do not ask before starting |
 
-`keep` deliberately does not rewrite those repositories to trixie. A repository
-pointed at a suite its publisher has not built is how you get a container
-half-upgraded.
+Probing runs from the Proxmox host, which always has curl. A container that
+cannot reach a repository the host can will fail at `apt update` before
+anything is upgraded, so the assumption is a cheap one.
 
 ### Afterwards
 
@@ -214,8 +228,8 @@ PHP applications need their modules reinstalling afterwards; trixie moves to PHP
 only `systemctl --failed` — a service can start perfectly and still have lost
 what it was pointed at.
 
-To sort a fleet into containers that will upgrade cleanly and ones that will
-not, look for foreign repositories first:
+To see what you are in for across a fleet before running anything, list the
+foreign repositories first:
 
 ```bash
 for id in $(pct list | awk 'NR>1 {print $1}'); do echo "=== $id ==="; pct exec $id -- grep -rhoE 'https?://[^ ]+' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | grep -v debian.org | sort -u; done
