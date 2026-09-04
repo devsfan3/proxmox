@@ -96,6 +96,137 @@ journalctl -u unifi-analyzer -f      # what it is doing
 The analyzer lives in `/opt/unifi-analyzer/app`, its data in
 `/opt/unifi-analyzer/data`, and it runs as the unprivileged `analyzer` user.
 
+## docassemble-lxc.sh
+
+Creates an unprivileged Debian LXC and runs
+[docassemble](https://github.com/jhpyle/docassemble) in it: a platform for
+guided interviews and document assembly. You write an interview in YAML, it
+asks someone the questions, and it hands back the filled-in documents.
+
+docassemble is a Docker deployment. There is a bare-metal install path, but it
+wants Python, PostgreSQL, Redis, RabbitMQ, Supervisor, uWSGI, nginx, texlive,
+LibreOffice, pandoc and tesseract wired together by hand, and upstream tells
+you plainly to use Docker instead. So the container has nesting turned on,
+Docker CE installed, and the official all-in-one image running with
+`CONTAINERROLE=all` — web, Celery, PostgreSQL, Redis and RabbitMQ in one place,
+on one persistent volume. Docker inside an unprivileged container needs both
+`nesting=1` and `keyctl=1`; the script sets both.
+
+The image comes from upstream on every install and update. This repository
+holds only the container script.
+
+### Install
+
+On the Proxmox VE host, as root:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/devsfan3/proxmox/main/docassemble-lxc.sh)"
+```
+
+It picks the next free container ID, the newest Debian template for the host's
+architecture, and the first storage that will hold a root disk. When it
+finishes it prints the address to open.
+
+| | Default |
+| --- | --- |
+| Container | unprivileged Debian, `nesting=1,keyctl=1`, `onboot` |
+| Resources | 4 cores, 8192 MB RAM, 2048 MB swap, 40 GB disk |
+| Network | `vmbr1`, DHCP |
+| Ports | 80 and 443, HTTP only |
+
+**Budget twenty to forty minutes.** The image is about 6 GB, and docassemble
+then spends another five to fifteen minutes on its first boot setting up
+PostgreSQL, Redis, RabbitMQ and its Python environment. Nothing is wrong; it
+is that slow once.
+
+Override any of it from the environment, or pass `--advanced` to be asked:
+
+```bash
+CTID=210 CT_HOSTNAME=da MEMORY=16384 DISK=100 BRIDGE=vmbr0 \
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/devsfan3/proxmox/main/docassemble-lxc.sh)"
+```
+
+Settings: `CTID`, `CT_HOSTNAME`, `STORAGE`, `TEMPLATE_STORAGE`, `TEMPLATE`,
+`CORES`, `MEMORY`, `SWAP`, `DISK`, `BRIDGE`, `VLAN`, `NET` (`dhcp` or a CIDR),
+`GATEWAY`, `TIMEZONE`, `DA_HOSTNAME`, `DA_IMAGE`, `UNPRIVILEGED`.
+
+Upstream asks for 4096 MB for the application alone and this container also
+carries a database, a message queue and LibreOffice, so 8192 is the default and
+the script warns below 4096. It refuses a `MEMORY` larger than the host has.
+
+### Update
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/devsfan3/proxmox/main/docassemble-lxc.sh)" -- --update
+```
+
+Flags go after the `--`. It finds the container it built, pulls the current
+image and recreates the application container on the same data volume, so
+configuration, interviews, uploads and the database all survive. It says so and
+stops if the image is already current. Add a container ID (`--update 210`) if
+you have more than one.
+
+Two other ways to the same thing: run the script *inside* the container and it
+updates that container, or run `docassemble-update` in there directly.
+
+How it was started is kept in `/etc/docassemble/run.env` rather than only in
+the container's environment, so an update can recreate the container without
+having to reconstruct the arguments.
+
+### Worth knowing before you use it
+
+**The default login is published.** A fresh instance is `admin@admin.com` with
+the password `password`, which is in upstream's own documentation. It prompts
+you to change it the first time you log in. Do that before the container is
+reachable by anyone else.
+
+**It serves plain HTTP.** Put a reverse proxy with TLS in front of it before it
+sees anything real. What docassemble holds is interview answers — other
+people's personal circumstances — and on port 80 that crosses your network in
+the clear.
+
+**docassemble writes its own address into the URLs it generates**, from
+`DAHOSTNAME`. The script sets that to the container's address, which on DHCP
+can change and take the links with it. Give the container a reservation or a
+static address. Once it has a real name, set it in the Configuration page of
+the web interface, or reinstall with `DA_HOSTNAME=da.example.com`.
+
+**PostgreSQL runs inside the application container**, so stopping it is not
+instant. Every stop path the script installs allows ten minutes: the Docker
+container's `--stop-timeout`, the daemon's `shutdown-timeout`, systemd's
+`TimeoutStopSec`, and the LXC's own `--startup down=600` so a host reboot does
+not kill the database mid-write. Use `docassemble-restart` rather than
+`docker restart`, which uses a ten second timeout. Do not shorten any of them.
+
+**If Docker falls back to the `vfs` storage driver**, the install says so. It
+copies whole layers instead of sharing them, so a 6 GB image costs several
+times that and runs slower. It means overlayfs is unavailable on that
+container's backing storage. Current Proxmox on ZFS is fine; this is a check,
+not an expectation.
+
+If the install fails before the image is pulled, the script destroys the
+container rather than leaving a broken one behind. After that it keeps it — the
+download is the expensive part, and the reason it is not serving is inside the
+container you would be deleting.
+
+### Afterwards
+
+```bash
+pct enter <CTID>          # a shell in the container
+docassemble-logs          # what it is doing
+docassemble-restart       # stop properly, then start
+docassemble-update        # pull the current image, keep the data
+docassemble-backup        # tar the data volume, application stopped
+docassemble-shell         # a shell inside the docassemble container itself
+```
+
+Everything — configuration, the database, uploads, and every package installed
+through the web interface — lives in the Docker volume `docassemble`, mounted
+at `/usr/share/docassemble`. That volume is the whole instance. Back it up with
+`docassemble-backup`, which stops the application first because a database
+copied while it is being written to is not a backup, or take the whole
+container with `vzdump`.
+
 ## cleanup-lxc-storage.sh
 
 Reclaims disk space *inside* the containers you already run, with the leftovers
@@ -307,6 +438,7 @@ the new container, not copied, so leave those paths out.
 
 ## Licence
 
-These scripts are MIT. The UniFi Support File Analyzer is a separate project
-under its own licence. Neither is an official Ubiquiti tool, and neither has
-any connection to Ubiquiti.
+These scripts are MIT. The UniFi Support File Analyzer and docassemble are
+separate projects under their own licences. Nothing here is an official
+Ubiquiti tool or has any connection to Ubiquiti, and nothing here is affiliated
+with the docassemble project.
